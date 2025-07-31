@@ -35,17 +35,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define ADC_MAX_VALUE 4095
-#define ADC_CENTER 2047      // Valor central do ADC (meio do joystick)
-#define DEAD_ZONE 100        // Zona morta ao redor do centro
-#define PWM_MAX_DUTY 840     // Valor máximo do duty cycle (ARR)
-
-#define MOTOR_PIN1 PIN_3     // PA3 - Controle direção 1
-#define MOTOR_PIN2 PIN_4 	 // PA4 - Controle direção 2
-
-#define LOOP_FREQUENCY 100   // Frequência do loop principal (Hz) - ajuste conforme seu delay
-#define MAX_CHANGE_PER_SEC (PWM_MAX_DUTY * 0.25f)  // 25% da velocidade máxima por segundo
-#define MAX_CHANGE_PER_LOOP (MAX_CHANGE_PER_SEC / LOOP_FREQUENCY)  // Mudança máxima por iteração
 
 /* USER CODE END PD */
 
@@ -63,7 +52,8 @@ DAC_HandleTypeDef hdac;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-
+volatile uint8_t buz = 0;
+volatile uint32_t cont = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -118,29 +108,77 @@ int main(void) {
 	Utility_Init();
 	USART1_Init();
 
-	ADC_Init(ADC1, SINGLE_CHANNEL, ADC_RES_12BITS);
-	ADC_SingleChannel(ADC1, ADC_IN0);
+	RCC->APB1ENR |= RCC_APB1ENR_TIM5EN;
+	TIM5->PSC = 8400 - 1;
+	TIM5->ARR = 100 - 1;
+	TIM5->EGR |= TIM_EGR_UG;
+	TIM5->CR1 &= ~TIM_CR1_DIR;
 
-	ADC1->CR2 |= 0b01 << 28;
-	ADC1->CR2 |= 0b1111 << 24;
+	TIM5->DIER |= TIM_DIER_UIE;
+	NVIC_EnableIRQ(TIM5_IRQn);
 
-	GPIO_Clock_Enable(GPIOB);
-	GPIO_Pin_Mode(GPIOB, PIN_11, INPUT);
-	GPIO_Resistor_Enable(GPIOB, PIN_11, PULL_DOWN);
+	TIM5->CR1 |= TIM_CR1_CEN; // habilita a ocntagem
 
-	RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN; // habilita o clock SYSCFG
-	SYSCFG->EXTICR[2] |= 0b0001 << 12; // seleciona PB11 como gatilho de EXTI11
-	EXTI->RTSR |= 1 << 11; // seleciona borda de subida
-	EXTI->EMT |= 1 << 11; // habilita o evento EXTI11 no controlador EXTI
+	// ---------------------------------------------------------------------
+
+	RCC->APB2ENR |= 1 << 8; //liga o clock da interface digital do ADC1
+	ADC->CCR |= 0b01 << 16; //prescaler /4
+	ADC1->SQR1 &= ~(0xF << 20); //conversão de apenas um canal
+	ADC1->SQR3 |= 16; //seleção do canal a ser convertido (IN_16)
+	ADC1->SMPR1 |= (7 << 18); //tempo de amostragem igual a 480 ciclos de ADCCLK
+	ADC->CCR |= (1 << 23); //liga o sensor de temperatura
+	ADC1->CR2 |= 1; //liga o conversor AD
+
+	uint32_t *p = (uint32_t *) 0x1FFF7A2C; //cria ponteiro para uma posição de memória
+	uint32_t Word = *p; //lê o conteúdo da memória
+	uint16_t TS_CAL1 = (Word & 0x0000FFFF); //lê o valor de TS_CAL1
+	uint16_t TS_CAL2 = (Word & 0xFFFF0000) >> 16; //lê o valor de TS_CAL2
+
+	GPIO_Clock_Enable(GPIOA);
+	GPIO_Pin_Mode(GPIOA, PIN_6, OUTPUT);
+
+	GPIO_Clock_Enable(GPIOA);
+	GPIO_Pin_Mode(GPIOA, PIN_7, OUTPUT);
+
+	GPIO_Clock_Enable(GPIOA);
+	GPIO_Pin_Mode(GPIOA, PIN_0, OUTPUT);
 
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
 	/* USER CODE BEGIN WHILE */
 	while (1) {
-		if (ADC1->SR & ADC_SR_EOC) {
-			printf("Leitura = %d\n", (int) ADC1->DR);
+		ADC1->CR2 |= 1 << 30; //inicia a conversão
+
+		while(!(ADC1->SR & 0x02)); //aguarda o fim da conversão
+
+		//cálculo da temperatura
+		float temperatura = ((80*(int)(ADC1->DR - TS_CAL1))/(TS_CAL2-TS_CAL1))+30;
+
+		printf("Temperatura = %.2f C\n", temperatura);
+
+		if (temperatura <= 50) {
+			printf("Valor dentro da faixa segura de operacao\n");
+			GPIO_Write_Pin(GPIOA, PIN_6, HIGH);
+			GPIO_Write_Pin(GPIOA, PIN_7, HIGH);
 		}
+
+		else if ((temperatura > 50) && (temperatura <= 60)) {
+			printf("Valor dentro da faixa de ATENCAO!\n");
+			GPIO_Write_Pin(GPIOA, PIN_6, LOW);
+			GPIO_Write_Pin(GPIOA, PIN_7, HIGH);
+
+			buz = 0;
+		}
+
+		else if (temperatura > 60) {
+			printf("Valor dentro da faixa de SUPERAQUECIMENTO!\n");
+			GPIO_Write_Pin(GPIOA, PIN_7, LOW);
+
+			buz = 1;
+		}
+
+		Delay_ms(1000);
 		/* USER CODE END WHILE */
 
 		/* USER CODE BEGIN 3 */
@@ -410,7 +448,22 @@ static void MX_GPIO_Init(void) {
 }
 
 /* USER CODE BEGIN 4 */
+void TIM5_IRQHandler(void) {
+	// Limpa a flag de interrupção
+	if (TIM5->SR & TIM_SR_UIF) {
+		TIM5->SR &= ~TIM_SR_UIF;
 
+		if (buz && (cont >= 10)) { // 50 * 10ms = 500ms (buzzer pisca a cada 0.5s)
+			GPIO_Toggle_Pin(GPIOA, PIN_0);
+			cont = 0;
+		} else if (!buz) {
+			GPIO_Write_Pin(GPIOA, PIN_0, LOW);
+			cont = 0;  // Reset contador quando buzzer desligado
+		}
+
+		cont++;
+	}
+}
 /* USER CODE END 4 */
 
 /**
